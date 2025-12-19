@@ -43,7 +43,6 @@ import com.loohp.limbo.inventory.ItemStack;
 import com.loohp.limbo.location.GlobalPos;
 import com.loohp.limbo.location.Location;
 import com.loohp.limbo.network.protocol.packets.ClientboundFinishConfigurationPacket;
-import com.loohp.limbo.network.protocol.packets.ClientboundLevelChunkWithLightPacket;
 import com.loohp.limbo.network.protocol.packets.ClientboundRegistryDataPacket;
 import com.loohp.limbo.network.protocol.packets.PacketHandshakingIn;
 import com.loohp.limbo.network.protocol.packets.PacketIn;
@@ -112,7 +111,6 @@ import com.loohp.limbo.utils.GameMode;
 import com.loohp.limbo.utils.InventoryClickUtils;
 import com.loohp.limbo.utils.MojangAPIUtils;
 import com.loohp.limbo.utils.MojangAPIUtils.SkinResponse;
-import com.loohp.limbo.world.BlockPosition;
 import com.loohp.limbo.world.BlockState;
 import com.loohp.limbo.world.World;
 import net.kyori.adventure.key.Key;
@@ -151,23 +149,28 @@ import java.util.TimerTask;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
-public class ClientConnection extends Thread {
+public class ClientConnection implements Runnable {
 
     private static final Key DEFAULT_HANDLER_NAMESPACE = Key.key("default");
     private static final String BRAND_ANNOUNCE_CHANNEL = Key.key("brand").toString();
 
     private final Random random = new Random();
     private final Socket clientSocket;
+    private final Lock packetSendLock = new ReentrantLock();
     protected Channel channel;
     private boolean running;
     private volatile ClientState state;
 
+    private final AtomicLong lastPacketTimestamp;
+    private final AtomicLong lastKeepAlivePayLoad;
+    private final AtomicLong lastKeepAliveResponse;
+
     private Player player;
     private TimerTask keepAliveTask;
-    private AtomicLong lastPacketTimestamp;
-    private AtomicLong lastKeepAlivePayLoad;
     private InetAddress inetAddress;
     private boolean ready;
 
@@ -176,6 +179,7 @@ public class ClientConnection extends Thread {
         this.inetAddress = clientSocket.getInetAddress();
         this.lastPacketTimestamp = new AtomicLong(-1);
         this.lastKeepAlivePayLoad = new AtomicLong(-1);
+        this.lastKeepAliveResponse = new AtomicLong(-1);
         this.channel = null;
         this.running = false;
         this.ready = false;
@@ -191,6 +195,10 @@ public class ClientConnection extends Thread {
 
     public void setLastKeepAlivePayLoad(long payLoad) {
         this.lastKeepAlivePayLoad.set(payLoad);
+    }
+
+    public long getLastKeepAliveResponse() {
+        return lastKeepAliveResponse.get();
     }
 
     public long getLastPacketTimestamp() {
@@ -234,9 +242,14 @@ public class ClientConnection extends Thread {
         sendPacket(packet);
     }
 
-    public synchronized void sendPacket(PacketOut packet) throws IOException {
-        if (channel.writePacket(packet)) {
-            setLastPacketTimestamp(System.currentTimeMillis());
+    public void sendPacket(PacketOut packet) throws IOException {
+        packetSendLock.lock();
+        try {
+            if (channel.writePacket(packet)) {
+                setLastPacketTimestamp(System.currentTimeMillis());
+            }
+        } finally {
+            packetSendLock.unlock();
         }
     }
 
@@ -251,6 +264,9 @@ public class ClientConnection extends Thread {
         } catch (IOException ignored) {
         }
         try {
+            ServerProperties properties = Limbo.getInstance().getServerProperties();
+            String str = (properties.isLogPlayerIPAddresses() ? inetAddress.getHostName() : "<ip address withheld>") + ":" + clientSocket.getPort();
+            Limbo.getInstance().getConsole().sendMessage("[/" + str + "] <-> Player disconnected with the reason " + PlainTextComponentSerializer.plainText().serialize(reason));
             clientSocket.close();
         } catch (IOException ignored) {
         }
@@ -646,27 +662,26 @@ public class ClientConnection extends Thread {
                 player.sendPlayerListHeaderAndFooter(properties.getTabHeader(), properties.getTabFooter());
                 
                 ready = true;
-                
+
                 keepAliveTask = new TimerTask() {
                     @Override
                     public void run() {
-                        if (state.equals(ClientState.DISCONNECTED)) {
+                        if (state != ClientState.PLAY || !ready) {
                             this.cancel();
-                        } else if (ready && state.equals(ClientState.PLAY)) {
-                            long now = System.currentTimeMillis();
-                            if (now - getLastPacketTimestamp() > 15000) {
-                                PacketPlayOutKeepAlive keepAlivePacket = new PacketPlayOutKeepAlive(now);
-                                try {
-                                    sendPacket(keepAlivePacket);
-                                    setLastKeepAlivePayLoad(now);
-                                } catch (Exception e) {
-                                }
-                            }
+                        }
+
+                        long now = System.currentTimeMillis();
+                        PacketPlayOutKeepAlive keepAlive = new PacketPlayOutKeepAlive(now);
+                        try {
+                            sendPacket(keepAlive);
+                            setLastKeepAlivePayLoad(now);
+                        } catch (IOException e) {
+                            cancel();
                         }
                     }
                 };
-                new Timer().schedule(keepAliveTask, 5000, 10000);
-                
+                new Timer().schedule(keepAliveTask, 0, 10000);
+
                 while (clientSocket.isConnected()) {
                     try {
                         CheckedBiConsumer<PlayerMoveEvent, Location, IOException> processMoveEvent = (event, originalTo) -> {
@@ -717,12 +732,12 @@ public class ClientConnection extends Thread {
                                 processMoveEvent.consume(event, to);
                             }
                         } else if (packetIn instanceof PacketPlayInKeepAlive) {
-                            long lastPayload = getLastKeepAlivePayLoad();
                             PacketPlayInKeepAlive alive = (PacketPlayInKeepAlive) packetIn;
-                            if (lastPayload == -1) {
-                                Limbo.getInstance().getConsole().sendMessage("Unsolicited KeepAlive packet for player " + player.getName());
-                            } else if (alive.getPayload() != lastPayload) {
-                                Limbo.getInstance().getConsole().sendMessage("Incorrect Payload received in KeepAlive packet for player " + player.getName());
+
+                            if (alive.getPayload() == getLastKeepAlivePayLoad()) {
+                                lastKeepAliveResponse.set(System.currentTimeMillis());
+                            } else {
+                                disconnect(Component.text("Bad Keepalive Payload"));
                                 break;
                             }
                         } else if (packetIn instanceof PacketPlayInTabComplete) {
